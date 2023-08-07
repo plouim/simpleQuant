@@ -11,6 +11,7 @@ from torch import optim
 import os
 from torchvision import transforms
 from torchinfo import summary
+import timm
 
 
 parser = argparse.ArgumentParser(description='train code')
@@ -18,6 +19,8 @@ parser = argparse.ArgumentParser(description='train code')
 group = parser.add_argument_group('Model settings')
 group.add_argument('--model', metavar='MODEL', type=str,
                   help='model name')
+group.add_argument('--pretrained', action='store_true',
+                  help='use pretrained model')
 group.add_argument('--checkpoint', metavar='CKPT', type=str,
                   help='checkpoint')
 group.add_argument('--num-classes', metavar='NUM', type=int,
@@ -36,12 +39,22 @@ group.add_argument('--stat', metavar='STAT', type=str,
 group = parser.add_argument_group('Train settings')
 group.add_argument('-b', '--batch-size', metavar='BATCH_SIZE', type=int,
                   help='batch size')
+group = parser.add_argument_group('Quantization settings')
+group.add_argument('--quant', action='store_true',
+                  help='use quantization')
+group.add_argument('--num-bit', metavar='BIT', type=int, default=8,
+                  help='the number of bit to use')
 group = parser.add_argument_group('Miscellaneous parameters')
 group.add_argument('--log-freq', metavar='FREQ', type=int, default=10,
                   help='train/val log frequancy, default=10')
+group.add_argument('--seed', metavar='SEED', type=int, default=42,
+                  help='random seed, default=42')
+group.add_argument('--rank', metavar='RANK', type=int, default=0,
+                  help='local rank, default=0')
 
-def test(model, epoch, dataloader, criterion):
+def test(model, epoch, dataloader, criterion, saver):
     args = parser.parse_args()
+    global best_acc
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.eval()
     test_loss = 0
@@ -57,15 +70,29 @@ def test(model, epoch, dataloader, criterion):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-            
+
             if batch_idx%args.log_freq == 0 or batch_idx+1 == len(dataloader):
                 print('[%d/%d] Loss: %.3f | Acc: %.3f%% (%d/%d)'
                     % (batch_idx, len(dataloader), test_loss/(batch_idx+1), 100.*correct/total, correct, total))
-                
+    # Save checkpoint.
+    if saver and args.save_path:
+        acc = 100.*correct/total
+        if acc > best_acc:
+            print('Saving to best model...')
+            if not os.path.isdir('checkpoint'):
+                os.mkdir('checkpoint')
+            saver.save_checkpoint(epoch, metric=acc)
+            best_acc = acc
+        if epoch == args.epoch-1:
+            print('Saving to last model')
+            if not os.path.isdir('checkpoint'):
+                os.mkdir('checkpoint')
+            saver.save_checkpoint(epoch)                
 
 def main():
     args = parser.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    timm.utils.random_seed(seed=args.seed, rank=args.rank)
 
     transform_list = []
     if args.img_size:
@@ -91,18 +118,27 @@ def main():
     test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=True)
 
     ## Load model
-    model = resnet50()
-    load_model(model, args.checkpoint, args.num_classes)
+    model = timm.create_model(
+            args.model,
+            checkpoint_path=args.checkpoint,
+            num_classes=args.num_classes,
+            pretrained=args.pretrained
+            )
+    print(f'Model {timm.models.safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+    #  model = resnet50()
+    #  load_model(model, args.checkpoint, args.num_classes)
     model.to(device)
     # summary(model, (1,3,args.img_size,args.img_size))
-
+    
     # quantize model
-    quant_conv_weight(model, kbit=8)
+    if args.quant:
+        print(f'Symmetric quantization: {args.num_bit}-bit')
+        quant_conv_weight(model, kbit=args.num_bit)
 
     ## Set loss func and optim
     criterion = nn.CrossEntropyLoss()
-
-    test(model=model, epoch=0, dataloader=test_dataloader, criterion=criterion)
+    
+    test(model=model, epoch=None, dataloader=test_dataloader, criterion=criterion, saver=None)
 
 if __name__=='__main__':
     main()

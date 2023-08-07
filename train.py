@@ -11,6 +11,7 @@ from torch import optim
 import os
 from torchvision import transforms
 from torchinfo import summary
+import timm
 
 
 parser = argparse.ArgumentParser(description='train code')
@@ -18,6 +19,8 @@ parser = argparse.ArgumentParser(description='train code')
 group = parser.add_argument_group('Model settings')
 group.add_argument('--model', metavar='MODEL', type=str,
                   help='model name')
+group.add_argument('--pretrained', action='store_true',
+                  help='use pretrained model')
 group.add_argument('--checkpoint', metavar='CKPT', type=str,
                   help='checkpoint')
 group.add_argument('--num-classes', metavar='NUM', type=int,
@@ -47,6 +50,10 @@ group.add_argument('--save-last', metavar='LAST', type=str, default='last.pth',
                   help='last model file name to save, default=last.pth')
 group.add_argument('--log-freq', metavar='FREQ', type=int, default=10,
                   help='train/val log frequancy, default=10')
+group.add_argument('--seed', metavar='SEED', type=int, default=42,
+                  help='random seed, default=42')
+group.add_argument('--rank', metavar='RANK', type=int, default=0,
+                  help='local rank, default=0')
 
 
 best_acc = 0
@@ -76,7 +83,7 @@ def train(model, epoch, dataloader, optimizer, criterion):
             print('[%d/%d] Loss: %.3f | Acc: %.3f%% (%d/%d)'
                 % (batch_idx, len(dataloader), train_loss/(batch_idx+1), 100.*correct/total, correct, total))
 
-def test(model, epoch, dataloader, criterion):
+def test(model, epoch, dataloader, criterion, saver):
     args = parser.parse_args()
     global best_acc
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -95,37 +102,28 @@ def test(model, epoch, dataloader, criterion):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            if batch_idx%args.log_freq == 0:
+            if batch_idx%args.log_freq == 0 or batch_idx+1 == len(dataloader):
                 print('[%d/%d] Loss: %.3f | Acc: %.3f%% (%d/%d)'
                     % (batch_idx, len(dataloader), test_loss/(batch_idx+1), 100.*correct/total, correct, total))
     # Save checkpoint.
-    if args.save_path:
+    if saver and args.save_path:
         acc = 100.*correct/total
         if acc > best_acc:
-            print('Saving to best model...') 
-            state = {
-                'net': model.state_dict(),
-                'acc': acc,
-                'epoch': epoch,
-            }
+            print('Saving to best model...')
             if not os.path.isdir('checkpoint'):
                 os.mkdir('checkpoint')
-            torch.save(state, os.path.join(args.save_path, args.save_best))
+            saver.save_checkpoint(epoch, metric=acc)
             best_acc = acc
         if epoch == args.epoch-1:
-            print('Saving to last model') 
-            state = {
-                'net': model.state_dict(),
-                'acc': acc,
-                'epoch': epoch,
-            }
+            print('Saving to last model')
             if not os.path.isdir('checkpoint'):
                 os.mkdir('checkpoint')
-            torch.save(state, os.path.join(args.save_path, args.save_last))
+            saver.save_checkpoint(epoch)
 
 def main():
     args = parser.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    timm.utils.random_seed(seed=args.seed, rank=args.rank)
 
     transform_list = []
     if args.img_size:
@@ -161,11 +159,18 @@ def main():
     test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=True)
 
     ## Load model
-    model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+    #  model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
     #  model = resnet50()
     #  load_model(model, './checkpoint/ckpt-cifar100.pth', 100)
-    if args.num_classes:
-        model.fc = nn.Linear(model.fc.in_features, args.num_classes)
+    model = timm.create_model(
+            args.model,
+            checkpoint_path=args.checkpoint,
+            pretrained=args.pretrained,
+            num_classes=args.num_classes
+            )
+    print(f'Model {timm.models.safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+    #  if args.num_classes:
+        #  model.fc = nn.Linear(model.fc.in_features, args.num_classes)
     model.to(device)
     # summary(model, (1,3,args.img_size,args.img_size))
 
@@ -179,9 +184,16 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
 
+    saver=timm.utils.CheckpointSaver(
+                        model=model,
+                        optimizer=optimizer,
+                        checkpoint_dir=args.save_path,
+                        max_history=1
+                        )
+
     for epoch in range(0, args.epoch):
         train(model=model, epoch=epoch, dataloader=train_dataloader, optimizer=optimizer, criterion=criterion)
-        test(model=model, epoch=epoch, dataloader=test_dataloader, criterion=criterion)
+        test(model=model, epoch=epoch, dataloader=test_dataloader, criterion=criterion, saver=saver)
         scheduler.step()
 
 if __name__=='__main__':
